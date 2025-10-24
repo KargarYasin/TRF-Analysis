@@ -1,0 +1,200 @@
+"""
+EEG Temporal Response Function (TRF) Model Comparison
+Single 2x2 figure with unified color scales for Complex vs. Simple conditions.
+"""
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.io import wavfile
+from scipy.signal import resample
+from sklearn.linear_model import Ridge
+import mne
+from mne.decoding import ReceptiveField
+from mne.stats import permutation_cluster_1samp_test
+
+# Optional: show plots in a separate window (Jupyter/IPython only)
+%matplotlib qt
+
+
+class Config:
+    SUBJECTS_ROOT_PATH = r'D:\MeDo\main_Language\thesis\MNE\Male'
+    AUDIO_FOLDER_PATH = r'D:\MeDo\main_Language\thesis\MNE\Audio'
+    EXCEL_PATH = r"D:\MeDo\main_Language\thesis\MNE\Male\Stimulus_timestamps.xlsx"
+    NUM_SUBJECTS = 37
+    TARGET_SFREQ = 128
+    TMIN = -0.2
+    TMAX = 0.5
+    RIDGE_ALPHA = 1e4
+    N_PERMUTATIONS = 5000
+    ALPHA_LEVEL = 0.05
+    CONDITION_SIMPLE = 33
+    CONDITION_COMPLEX = 14
+
+
+def load_and_preprocess_audio(audio_filepath, target_sfreq):
+    sfreq_audio, audio = wavfile.read(audio_filepath)
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+    envelope = np.abs(audio)
+    n_target = int(len(envelope) * (target_sfreq / sfreq_audio))
+    envelope = resample(envelope, n_target)
+    return envelope / np.std(envelope)
+
+
+def extract_linguistic_features(word_info_df, num_samples, target_sfreq):
+    onset = np.zeros(num_samples)
+    surprisal = np.zeros(num_samples)
+    for _, row in word_info_df.iterrows():
+        s = int(row['start'] * target_sfreq)
+        if 0 <= s < num_samples:
+            onset[s] = 1
+            surprisal[s] = row['surprisal']
+    return onset, surprisal
+
+
+def fit_trf_model(X, Y, config, feature_names):
+    trf = ReceptiveField(
+        tmin=config.TMIN,
+        tmax=config.TMAX,
+        sfreq=config.TARGET_SFREQ,
+        feature_names=feature_names,
+        estimator=Ridge(alpha=config.RIDGE_ALPHA),
+    )
+    trf.fit(X, Y)
+    return trf.score(X, Y)
+
+
+def perform_model_comparison_analysis(config, condition_to_analyze):
+    print("=" * 70)
+    print(f"MODEL COMPARISON ANALYSIS - CONDITION C{condition_to_analyze:02d}")
+    print("=" * 70)
+
+    audio_filepath = os.path.join(config.AUDIO_FOLDER_PATH, f"{condition_to_analyze:02d}.wav")
+    try:
+        audio_envelope = load_and_preprocess_audio(audio_filepath, config.TARGET_SFREQ)
+        word_info_df = pd.read_excel(config.EXCEL_PATH, sheet_name=str(condition_to_analyze))
+    except Exception as e:
+        print(f"✗ Prerequisite data failed to load: {e}")
+        return None, None
+
+    all_score_improvements = []
+
+    for subject_num in range(1, config.NUM_SUBJECTS + 1):
+        subject_id = f"S{subject_num:02d}"
+        try:
+            eeg_filepath = os.path.join(
+                config.SUBJECTS_ROOT_PATH, subject_id, f"{subject_id}_C{condition_to_analyze:02d}_raw.fif"
+            )
+            raw = mne.io.read_raw_fif(eeg_filepath, preload=True, verbose=False)
+            raw.resample(config.TARGET_SFREQ, verbose=False)
+
+            min_length = min(len(audio_envelope), raw.n_times)
+            eeg_data = raw.get_data()[:, :min_length]
+            current_audio_envelope = audio_envelope[:min_length]
+
+            word_onset, surprisal = extract_linguistic_features(word_info_df, min_length, config.TARGET_SFREQ)
+
+            X_baseline = current_audio_envelope.reshape(-1, 1)
+            X_full = np.column_stack([current_audio_envelope, word_onset, surprisal])
+            Y = (eeg_data / np.std(eeg_data, axis=1, keepdims=True)).T
+
+            scores_baseline = fit_trf_model(X_baseline, Y, config, ['Envelope'])
+            scores_full = fit_trf_model(X_full, Y, config, ['Envelope', 'Onset', 'Surprisal'])
+
+            all_score_improvements.append(scores_full - scores_baseline)
+            print(f"✓ {subject_id}: Processing successful.")
+        except Exception as e:
+            print(f"✗ {subject_id}: Processing failed - {e}")
+            continue
+
+    if not all_score_improvements:
+        return None, None
+    return np.array(all_score_improvements), raw.info
+
+
+def plot_results_on_axes(score_improvements, info, condition_num, config, vlim, ax_topo, ax_hist):
+    print(f"\n--- Running stats & plotting for C{condition_num:02d} ---")
+
+    t_obs, clusters, p_vals, _ = permutation_cluster_1samp_test(
+        score_improvements, n_permutations=config.N_PERMUTATIONS, tail=1, n_jobs=-1, verbose=False
+    )
+
+    significant_mask = np.zeros(score_improvements.shape[1], dtype=bool)
+    for i, cl in enumerate(clusters):
+        if p_vals[i] <= config.ALPHA_LEVEL:
+            significant_mask[cl[0]] = True
+
+    mean_improvement = np.mean(score_improvements, axis=0)
+
+    im, _ = mne.viz.plot_topomap(
+        mean_improvement,
+        info,
+        axes=ax_topo,
+        show=False,
+        mask=significant_mask,
+        mask_params=dict(markersize=6, markerfacecolor='white'),
+        cmap='Reds',
+        vlim=vlim,
+    )
+    ax_topo.set_title(f'Model Improvement (ΔR²)\nCondition C{condition_num:02d}')
+
+    ax_hist.hist(mean_improvement, bins=25, edgecolor='black', range=vlim)
+    ax_hist.axvline(0, color='red', linestyle='--', label='No improvement')
+    ax_hist.axvline(np.mean(mean_improvement), color='green', linestyle='-', label=f'Mean = {np.mean(mean_improvement):.4f}')
+    ax_hist.set_xlabel('ΔR² (Full - Baseline)')
+    ax_hist.set_ylabel('Number of Channels')
+    ax_hist.set_title(f'Distribution - C{condition_num:02d}')
+    ax_hist.legend()
+    ax_hist.grid(True, alpha=0.3)
+    ax_hist.set_xlim(vlim)
+
+    return im
+
+
+def main():
+    config = Config()
+    plt.rcParams.update({'font.family': 'Times New Roman', 'font.size': 12})
+
+    improvements_complex, info_complex = perform_model_comparison_analysis(config, config.CONDITION_COMPLEX)
+    improvements_simple, info_simple = perform_model_comparison_analysis(config, config.CONDITION_SIMPLE)
+
+    global_max = 0
+    if improvements_complex is not None:
+        global_max = max(global_max, np.max(np.mean(improvements_complex, axis=0)))
+    if improvements_simple is not None:
+        global_max = max(global_max, np.max(np.mean(improvements_simple, axis=0)))
+    vlim = (0, global_max * 1.15) if global_max > 0 else (0, 0.01)
+    print(f"\nUnified color scale set to: (0, {vlim[1]:.4f})")
+
+    fig, axes = plt.subplots(
+        2, 2, figsize=(16, 12), gridspec_kw={'width_ratios': [1, 1], 'height_ratios': [1, 1]}
+    )
+
+    if improvements_complex is not None:
+        im_complex = plot_results_on_axes(
+            improvements_complex, info_complex, config.CONDITION_COMPLEX, config, vlim,
+            ax_topo=axes[0, 0], ax_hist=axes[1, 0]
+        )
+        fig.colorbar(im_complex, ax=axes[0, 0], label='ΔR² (Improvement)', shrink=0.8)
+
+    if improvements_simple is not None:
+        im_simple = plot_results_on_axes(
+            improvements_simple, info_simple, config.CONDITION_SIMPLE, config, vlim,
+            ax_topo=axes[0, 1], ax_hist=axes[1, 1]
+        )
+        fig.colorbar(im_simple, ax=axes[0, 1], label='ΔR² (Improvement)', shrink=0.8)
+
+    fig.suptitle('Model Improvement Comparison: Complex vs. Simple Condition', fontsize=18)
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+
+    output_filename = 'Model_Comparison_Combined.png'
+    fig.savefig(output_filename, dpi=300)
+    print(f"\nCombined plot saved successfully to: {output_filename}")
+
+    plt.show()
+
+
+if __name__ == "__main__":
+    main()
